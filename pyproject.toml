@@ -226,3 +226,8 @@ default-groups = [
 [[tool.uv.index]]
 name = "nvidia-pypi"
 url = "https://pypi.nvidia.com"
+
+[tool.uv.workspace]
+members = [
+    "llama-index-integrations/readers/llama-index-readers-webdav",
+]
