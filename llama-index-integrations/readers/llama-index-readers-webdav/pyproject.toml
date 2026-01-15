@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = []
+
+[project]
+name = "llama-index-readers-webdav"
+version = "0.1.0"
+description = "llama-index readers webdav integration"
+authors = [{name = "Andrea Castellini", email = "and1@live.it"}]
+readme = "README.md"
+license = "MIT"
+maintainers = [{name = "andyts93"}]
+requires-python = ">=3.9, <4.0"
+dependencies = [
+    "file>=0.3.0",
+    "ipykernel>=6.30.1",
+    "llama-index-core>=0.13.0,<0.15",
+    "webdavclient3>=3.14.6",
+]
+
+[tool.codespell]
+check-filenames = true
+check-hidden = true
+skip = "*.csv,*.html,*.json,*.jsonl,*.pdf,*.txt,*.ipynb"
+
+[tool.hatch.build.targets.sdist]
+include = ["llama_index/"]
+exclude = ["**/BUILD"]
+
+[tool.hatch.build.targets.wheel]
+include = ["llama_index/"]
+exclude = ["**/BUILD"]
+
+[tool.llamahub]
+contains_example = false
+import_path = "llama_index.readers.webdav"
+
+[tool.llamahub.class_authors]
+WebdavReader = "andyts93"
+
+[tool.mypy]
+disallow_untyped_defs = true
+exclude = ["_static", "build", "examples", "notebooks", "venv"]
+ignore_missing_imports = true
+python_version = "3.8"
