@@ -1,2 +1,5 @@
 .venv
 .webdav_smart_cache.json
+dist
+llama_index/readers/webdav/__pycache__
+.idea
