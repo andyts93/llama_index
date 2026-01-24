@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 from datetime import datetime
-from typing import Optional, Dict, Union, List
+from typing import Optional, Dict, Union, List, Generator
 
 from llama_index.core import Document, SimpleDirectoryReader
 from llama_index.core.readers.base import BaseReader
@@ -34,6 +34,7 @@ class WebDAVReader(BaseReader):
         max_workers: int = 10,
         logger: Optional[logging.Logger] = None,
         folder_etag_propagated_to_root: bool = True,
+        batch_etag_check: bool = True,
     ):
         self.client = Client(webdav_options)
         self.remote_path = remote_path
@@ -44,6 +45,7 @@ class WebDAVReader(BaseReader):
         self.max_workers = max_workers
         self.cache = self._load_cache()
         self.folder_etag_propagated_to_root = folder_etag_propagated_to_root
+        self.batch_etag_check = batch_etag_check
 
         # Required for direct HTTP requests
         self.base_url = webdav_options.get("webdav_hostname", "")
@@ -87,76 +89,25 @@ class WebDAVReader(BaseReader):
         except Exception:
             return None
 
-    def _scan_folder_if_changed(
-        self, folder_path: str, depth: int = 0
-    ) -> tuple[List[str], List[str]]:
+    def _check_file_etag(self, file_path: str) -> bool:
         """
-        Scans folder only if its Etag is changed
-
-        :param folder_path:
-        :param depth:
-        :return: (files_to_check, subfolders_to_check)
+        Check if a single file has changed
+        :return: True if file has changed or is new
         """
-        current_etag = self._get_folder_etag(folder_path)
-        cached_etag = self.cache["folders"].get(folder_path, {}).get("etag")
-        # folder_path = folder_path if folder_path.endswith('/') else folder_path + '/'
+        current_etag = self._get_etag(file_path)
+        cached_etag = self.cache["files"].get(file_path, {}).get("etag")
 
-        if (
-            self.folder_etag_propagated_to_root
-            and current_etag
-            and current_etag == cached_etag
-        ):
-            self.logger.debug(f"  {'  ' * depth}⏭️  {folder_path} (not modified)")
-            return [], []
+        is_changed = (
+            current_etag is None or cached_etag is None or current_etag != cached_etag
+        )
 
-        self.logger.debug(f"  {'  ' * depth}⏭️  {folder_path} (modified or new)")
+        if is_changed:
+            self.cache["files"][file_path] = {
+                "etag": current_etag,
+                "last_check": datetime.now().isoformat(),
+            }
 
-        files_to_check = []
-        subfolders = []
-
-        try:
-            items = self.client.list(folder_path, get_info=True)
-        except Exception as e:
-            self.logger.error(f"Listing  {'  ' * depth}❌  {folder_path}: {e}")
-            return [], []
-
-        for item in items:
-            if item in [".", "..", ""]:
-                continue
-            if isinstance(item, dict):
-                item_name = item.get("name")
-                if not item_name:
-                    item_name = (
-                        item.get("path", "").replace(folder_path, "").lstrip("/")
-                    )
-
-                if not item_name or item_name in [".", ".."]:
-                    continue
-
-                remote_item = f"{folder_path.rstrip('/')}/{item_name}"
-                is_dir = item.get("isdir", False)
-            else:
-                remote_item = f"{folder_path.rstrip('/')}/{item}"
-                is_dir = self.client.is_dir(remote_item)
-
-            if is_dir:
-                if self.recursive:
-                    subfolders.append(remote_item)
-            else:
-                if self.required_exts:
-                    ext = os.path.splitext(remote_item)[1].lower()
-                    if ext not in self.required_exts:
-                        continue
-
-                files_to_check.append(remote_item)
-
-        # Update folder Etag cached
-        self.cache["folders"][folder_path] = {
-            "etag": current_etag,
-            "last_check": datetime.now().isoformat(),
-        }
-
-        return files_to_check, subfolders
+        return is_changed
 
     def _check_files_etags_parallel(self, file_paths: List[str]) -> List[str]:
         """
@@ -190,108 +141,186 @@ class WebDAVReader(BaseReader):
 
         return [path for path, changed in results if changed]
 
-    def _smart_scan(self) -> List[str]:
+    def _download_and_parse_file(self, file_path: str, tmp_dir: str) -> List[Document]:
         """
-        Smart scan:
-        1. Checks folder's Etag
-        2. If changed, scan content
-        3. Recursively on subfolders
-        4. For each file, Etag check
-        :return: changed files
+        Downloads and parses a single file
+
+        :param file_path: Remote file path
+        :param tmp_dir: Temporary directory for download
+        :return: List of documents from the file
         """
-        all_changed_files = []
-        folders_to_scan = [self.remote_path]
+        rel_path = file_path.replace(self.remote_path.rstrip("/"), "").lstrip("/")
+        tmp_file = os.path.join(tmp_dir, rel_path)
 
-        while folders_to_scan:
-            folder = folders_to_scan.pop(0)
-            files, subfolders = self._scan_folder_if_changed(folder)
+        os.makedirs(os.path.dirname(tmp_file), exist_ok=True)
 
-            if files:
-                self.logger.debug(f" -> Checking {len(files)} files in parallel")
-                changed = self._check_files_etags_parallel(files)
-                all_changed_files.extend(changed)
-                self.logger.debug(f"   ✅ {len(changed)} modified files")
+        try:
+            self.client.download_sync(
+                remote_path=file_path,
+                local_path=tmp_file,
+            )
+            self.logger.debug(f"📥 {rel_path} downloaded")
 
-            folders_to_scan.extend(subfolders)
-
-        return all_changed_files
-
-    def _get_all_files_simple(self) -> List[str]:
-        """Simple scan for first sync"""
-
-        def scan_recursive(path):
-            files = []
-            items = self.client.list(path)
-
-            for item in items:
-                if item in [".", "..", ""]:
-                    continue
-
-                remote_item = f"{path.rstrip('/')}/{item}"
-
-                if self.client.is_dir(remote_item):
-                    if self.recursive:
-                        files.extend(scan_recursive(remote_item))
-                else:
-                    if self.required_exts:
-                        ext = os.path.splitext(remote_item)[1].lower()
-                        if ext not in self.required_exts:
-                            continue
-                    files.append(remote_item)
-
-            return files
-
-        return scan_recursive(self.remote_path)
-
-    def load_data(self, incremental: bool = True) -> List[Document]:
-        if incremental and (self.cache["folders"] or self.cache["files"]):
-            files_to_download = self._smart_scan()
-        else:
-            self.logger.debug("Complete scan")
-            all_files = self._get_all_files_simple()
-
-            self._check_files_etags_parallel(all_files)
-
-            files_to_download = all_files
-
-        self.logger.debug(f"🚀 Files to download: {len(files_to_download)}")
-
-        if not files_to_download:
-            self.logger.debug("✅ No changes detected")
-            return []
-
-        self.logger.debug("Downloading files")
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            for file_path in files_to_download:
-                rel_path = file_path.replace(self.remote_path.rstrip("/"), "").lstrip(
-                    "/"
-                )
-                tmp_file = os.path.join(tmp_dir, rel_path)
-
-                os.makedirs(os.path.dirname(tmp_file), exist_ok=True)
-
-                try:
-                    self.client.download_sync(
-                        remote_path=file_path,
-                        local_path=tmp_file,
-                    )
-                    self.logger.debug(f"{rel_path} downloaded")
-                except Exception as e:
-                    self.logger.error(f"{rel_path}: {e}")
-
+            # Parse the single file
             simple_loader = SimpleDirectoryReader(
-                tmp_dir,
+                input_files=[tmp_file],
                 file_extractor=self.file_extractor,
                 required_exts=self.required_exts,
-                recursive=True,
             )
 
             documents = simple_loader.load_data()
 
-        self._save_cache()
-        self.logger.debug(f"✅ Loaded {len(documents)} documents")
+            # Add metadata about the source
+            for doc in documents:
+                doc.metadata["webdav_path"] = file_path
+                doc.metadata["webdav_filename"] = os.path.basename(file_path)
 
-        return documents
+            self.logger.debug(f"✅ {rel_path} parsed ({len(documents)} docs)")
+
+            # Clean up immediately
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception as e:
+                self.logger.warning(f"Could not remove temp file {tmp_file}: {e}")
+
+            return documents
+
+        except Exception as e:
+            self.logger.error(f"❌ {rel_path}: {e}")
+            return []
+
+    def _scan_and_yield_folder(
+        self, folder_path: str, tmp_dir: str, depth: int = 0
+    ) -> Generator[Document, None, None]:
+        """
+        Scans a folder and yields documents immediately as files are found
+        Also yields from subfolders recursively
+
+        :param folder_path: Folder to scan
+        :param tmp_dir: Temporary directory for downloads
+        :param depth: Recursion depth (for logging)
+        :yield: Documents from files
+        """
+        # Check if folder has changed
+        current_etag = self._get_folder_etag(folder_path)
+        cached_etag = self.cache["folders"].get(folder_path, {}).get("etag")
+
+        if (
+            self.folder_etag_propagated_to_root
+            and current_etag
+            and current_etag == cached_etag
+        ):
+            self.logger.debug(f"  {'  ' * depth}⏭️  {folder_path} (not modified)")
+            return
+
+        self.logger.debug(f"  {'  ' * depth}📂 {folder_path} (scanning)")
+
+        files_in_folder = []
+        subfolders = []
+
+        try:
+            items = self.client.list(folder_path, get_info=True)
+        except Exception as e:
+            self.logger.error(f"Listing  {'  ' * depth}❌  {folder_path}: {e}")
+            return
+
+        # Separate files and folders
+        for item in items:
+            if item in [".", "..", ""]:
+                continue
+            if isinstance(item, dict):
+                item_name = item.get("name")
+                if not item_name:
+                    item_name = (
+                        item.get("path", "").replace(folder_path, "").lstrip("/")
+                    )
+
+                if not item_name or item_name in [".", ".."]:
+                    continue
+
+                remote_item = f"{folder_path.rstrip('/')}/{item_name}"
+                is_dir = item.get("isdir", False)
+            else:
+                remote_item = f"{folder_path.rstrip('/')}/{item}"
+                is_dir = self.client.is_dir(remote_item)
+
+            if is_dir:
+                if self.recursive:
+                    subfolders.append(remote_item)
+            else:
+                if self.required_exts:
+                    ext = os.path.splitext(remote_item)[1].lower()
+                    if ext not in self.required_exts:
+                        continue
+
+                files_in_folder.append(remote_item)
+
+        # Update folder cache
+        self.cache["folders"][folder_path] = {
+            "etag": current_etag,
+            "last_check": datetime.now().isoformat(),
+        }
+
+        # Process files in this folder
+        if files_in_folder:
+            if self.batch_etag_check and len(files_in_folder) > 1:
+                # Check etags in parallel for efficiency
+                self.logger.debug(
+                    f"  {'  ' * depth}🔍 Checking {len(files_in_folder)} files"
+                )
+                changed_files = self._check_files_etags_parallel(files_in_folder)
+            else:
+                # Check one by one (useful for immediate yielding)
+                changed_files = []
+                for file_path in files_in_folder:
+                    if self._check_file_etag(file_path):
+                        changed_files.append(file_path)
+
+            # Download and yield documents immediately
+            for file_path in changed_files:
+                documents = self._download_and_parse_file(file_path, tmp_dir)
+                for doc in documents:
+                    yield doc
+
+        # Recursively process subfolders
+        for subfolder in subfolders:
+            yield from self._scan_and_yield_folder(subfolder, tmp_dir, depth + 1)
+
+    def load_data(self, incremental: bool = True) -> List[Document]:
+        """
+        Legacy method for backward compatibility - loads all documents at once
+        """
+        return list(self.lazy_load_data(incremental=incremental))
+
+    def lazy_load_data(
+        self, incremental: bool = True
+    ) -> Generator[Document, None, None]:
+        """
+        Yields documents one by one as folders are scanned and files are parsed
+        No waiting for complete scan - immediate streaming
+
+        :param incremental: If True, uses smart scan with etag checking
+        :yield: Individual documents
+        """
+        self.logger.debug(
+            f"🚀 Starting {'incremental' if incremental else 'full'} scan"
+        )
+
+        if not incremental:
+            # Clear cache for full scan
+            self.cache = {"folders": {}, "files": {}}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            total_docs = 0
+
+            # Start scanning and yielding immediately
+            for doc in self._scan_and_yield_folder(self.remote_path, tmp_dir):
+                total_docs += 1
+                self._save_cache()
+                yield doc
+
+            self.logger.debug(f"✅ Yielded {total_docs} documents total")
 
     def get_stats(self) -> Dict:
         return {
