@@ -7,7 +7,7 @@ dev = []
 
 [project]
 name = "llama-index-readers-webdav"
-version = "0.2.0"
+version = "0.2.1"
 description = "llama-index readers webdav integration"
 authors = [{name = "Andrea Castellini", email = "and1@live.it"}]
 readme = "README.md"

@@ -4,7 +4,6 @@ import os
 import tempfile
 from datetime import datetime
 from typing import Optional, Dict, Union, List, Generator
-
 from llama_index.core import Document, SimpleDirectoryReader
 from llama_index.core.readers.base import BaseReader
 from llama_index.core.bridge.pydantic import Field
@@ -73,7 +72,6 @@ class WebDAVReader(BaseReader):
         """Get etag with HEAD request"""
         try:
             url = f"{self.base_url.rstrip('/')}/{remote_path}"
-            print(url)
             response = requests.get(url, auth=self.auth, timeout=10)
             etag = response.headers.get("ETag", "").strip('"')
             return etag if etag else None
@@ -89,36 +87,38 @@ class WebDAVReader(BaseReader):
         except Exception:
             return None
 
-    def _check_file_etag(self, file_path: str) -> bool:
+    def _check_file_etag(self, file: dict) -> bool:
         """
         Check if a single file has changed
         :return: True if file has changed or is new
         """
-        current_etag = self._get_etag(file_path)
-        cached_etag = self.cache["files"].get(file_path, {}).get("etag")
+        current_etag = file["etag"].strip('"') or self._get_etag(file["remote_path"])
+        cached_etag = self.cache["files"].get(file["remote_path"], {}).get("etag")
 
         is_changed = (
             current_etag is None or cached_etag is None or current_etag != cached_etag
         )
 
         if is_changed:
-            self.cache["files"][file_path] = {
+            self.cache["files"][file["remote_path"]] = {
                 "etag": current_etag,
                 "last_check": datetime.now().isoformat(),
             }
 
         return is_changed
 
-    def _check_files_etags_parallel(self, file_paths: List[str]) -> List[str]:
+    def _check_files_etags_parallel(self, files: List[dict]) -> List[dict]:
         """
         Checks Etag of multiple files in parallel
         :param file_paths:
         :return: modified_files
         """
 
-        def check_single_file(path):
-            current_etag = self._get_etag(path)
-            cached_etag = self.cache["files"].get(path, {}).get("etag")
+        def check_single_file(file: dict):
+            current_etag = file["etag"].strip('"') or self._get_etag(
+                file["remote_path"]
+            )
+            cached_etag = self.cache["files"].get(file["remote_path"], {}).get("etag")
 
             is_changed = (
                 current_etag is None
@@ -127,21 +127,21 @@ class WebDAVReader(BaseReader):
             )
 
             if is_changed:
-                self.cache["files"][path] = {
+                self.cache["files"][file["remote_path"]] = {
                     "etag": current_etag,
                     "last_check": datetime.now().isoformat(),
                 }
 
-            return path, is_changed
+            return file, is_changed
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.max_workers
         ) as executor:
-            results = executor.map(check_single_file, file_paths)
+            results = executor.map(check_single_file, files)
 
-        return [path for path, changed in results if changed]
+        return [file for file, changed in results if changed]
 
-    def _download_and_parse_file(self, file_path: str, tmp_dir: str) -> List[Document]:
+    def _download_and_parse_file(self, file: dict, tmp_dir: str) -> List[Document]:
         """
         Downloads and parses a single file
 
@@ -149,14 +149,16 @@ class WebDAVReader(BaseReader):
         :param tmp_dir: Temporary directory for download
         :return: List of documents from the file
         """
-        rel_path = file_path.replace(self.remote_path.rstrip("/"), "").lstrip("/")
+        rel_path = (
+            file["remote_path"].replace(self.remote_path.rstrip("/"), "").lstrip("/")
+        )
         tmp_file = os.path.join(tmp_dir, rel_path)
 
         os.makedirs(os.path.dirname(tmp_file), exist_ok=True)
 
         try:
             self.client.download_sync(
-                remote_path=file_path,
+                remote_path=file["remote_path"],
                 local_path=tmp_file,
             )
             self.logger.debug(f"📥 {rel_path} downloaded")
@@ -172,8 +174,10 @@ class WebDAVReader(BaseReader):
 
             # Add metadata about the source
             for doc in documents:
-                doc.metadata["webdav_path"] = file_path
-                doc.metadata["webdav_filename"] = os.path.basename(file_path)
+                doc.metadata["webdav_path"] = file["remote_path"]
+                doc.metadata["webdav_filename"] = os.path.basename(file["remote_path"])
+                doc.metadata["creation_date"] = file["created"]
+                doc.metadata["last_modified_date"] = file["modified"]
 
             self.logger.debug(f"✅ {rel_path} parsed ({len(documents)} docs)")
 
@@ -254,7 +258,7 @@ class WebDAVReader(BaseReader):
                     if ext not in self.required_exts:
                         continue
 
-                files_in_folder.append(remote_item)
+                files_in_folder.append({**item, "remote_path": remote_item})
 
         # Update folder cache
         self.cache["folders"][folder_path] = {
@@ -273,13 +277,13 @@ class WebDAVReader(BaseReader):
             else:
                 # Check one by one (useful for immediate yielding)
                 changed_files = []
-                for file_path in files_in_folder:
-                    if self._check_file_etag(file_path):
-                        changed_files.append(file_path)
+                for file in files_in_folder:
+                    if self._check_file_etag(file):
+                        changed_files.append(file)
 
             # Download and yield documents immediately
-            for file_path in changed_files:
-                documents = self._download_and_parse_file(file_path, tmp_dir)
+            for file in changed_files:
+                documents = self._download_and_parse_file(file, tmp_dir)
                 for doc in documents:
                     yield doc
 
